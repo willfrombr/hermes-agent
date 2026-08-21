@@ -32,7 +32,7 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             "</tool_call>"
         )
 
-        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "")):
+        with patch.object(self.client, "_run_prompt", return_value=(tool_response, "", None)):
             stream = self.client._create_chat_completion(
                 model="copilot-acp",
                 messages=[{"role": "user", "content": "read README.md"}],

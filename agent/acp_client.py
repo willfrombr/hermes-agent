@@ -226,18 +226,20 @@ def _acp_permission_mode() -> str:
 
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
-    model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
 ) -> str:
+    # The "Hermes requested model hint" line is NOT appended here any more.
+    # _run_prompt owns it, gated on the config-option path not running:
+    # once session/set_config_option succeeds, a hint naming the requested
+    # id would be a contradictory instruction alongside the model the
+    # session is actually serving.
     sections: list[str] = [
         "You are being used as the active ACP agent backend for Hermes.",
         "Use ACP capabilities to complete tasks.",
         "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
         "If no tool is needed, answer normally.",
     ]
-    if model:
-        sections.append(f"Hermes requested model hint: {model}")
 
     if isinstance(tools, list) and tools:
         tool_specs: list[dict[str, Any]] = []
@@ -624,7 +626,6 @@ class ACPClient:
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
             messages or [],
-            model=model,
             tools=tools,
             tool_choice=tool_choice,
         )
@@ -644,9 +645,10 @@ class ACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
+        response_text, reasoning_text, resolved_model = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            model=model,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -669,13 +671,134 @@ class ACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or f"{self.agent_name}-acp",
+            # Prefer the agent-confirmed model id so the UI reports what
+            # actually served the turn, not merely what was requested.
+            model=resolved_model or model or f"{self.agent_name}-acp",
         )
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    @staticmethod
+    def _maybe_append_model_hint(
+        prompt_text: str,
+        model: str | None,
+        mapping: "tuple[str, str, str] | None",
+        agent_name: str,
+    ) -> str:
+        """Append the legacy model hint ONLY when the config-option path
+        did not run.
+
+        The hint moved here from ``_format_messages_as_prompt``: once
+        ``session/set_config_option`` honours an explicit pick, a prompt-text
+        hint naming the requested id would sit alongside — and disagree
+        with — the model actually serving the session. It still appears for
+        agents advertising no model option (``mapping is None`` — e.g.
+        Copilot today) and for sentinel picks that keep the agent default,
+        which is exactly the pre-existing behaviour on those paths.
+        """
+        if model and (
+            mapping is None
+            or ACPClient._is_model_sentinel(model, agent_name)
+        ):
+            return f"{prompt_text}\nHermes requested model hint: {model}"
+        return prompt_text
+
+    @staticmethod
+    def _is_model_sentinel(requested: str, agent_name: str) -> bool:
+        """A pick that means "keep the agent's default" — no set call runs.
+
+        Shared between option resolution and the prompt-hint gate so the two
+        never disagree about what counts as a sentinel.
+        """
+        req = (requested or "").strip().lower()
+        return req in ("", "default", f"{agent_name}-acp", agent_name)
+
+    @staticmethod
+    def _resolve_model_option(
+        config_options: list[Any],
+        requested: str,
+        agent_name: str,
+    ) -> tuple[str, str, str] | None:
+        """Map a Hermes-side model id onto the agent's advertised model option.
+
+        ACP agents MAY advertise a ``SessionConfigOption`` with
+        ``category: "model"`` in the ``session/new`` response (stable since
+        spec v1). When present, ``session/set_config_option`` switches the
+        live session's model — the prompt-text "model hint" the flattened
+        prompt carries is ignored by real agents, so this is the only path
+        that actually honours the user's picker choice.
+
+        Returns ``(config_id, target_value, current_value)`` or ``None`` when
+        no model option is advertised. Sentinel ids ("default", "<agent>-acp",
+        empty) resolve to the agent's current default without a set call.
+        Raises ``RuntimeError`` when the agent advertises models but the
+        requested id matches none — a wrong pick must surface, not silently
+        fall back to whatever the agent defaults to.
+        """
+        option = None
+        for candidate in config_options or []:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("category") == "model" or candidate.get("id") == "model":
+                option = candidate
+                break
+        if option is None:
+            return None
+
+        config_id = str(option.get("id") or "model")
+        current = str(option.get("currentValue") or "")
+        choices = [c for c in option.get("options") or [] if isinstance(c, dict)]
+
+        req = (requested or "").strip().lower()
+        if ACPClient._is_model_sentinel(requested, agent_name):
+            return (config_id, current, current)
+
+        for choice in choices:  # exact value, then exact display name
+            value = str(choice.get("value") or "")
+            name = str(choice.get("name") or "")
+            if req == value.lower() or req == name.lower():
+                return (config_id, value, current)
+        for choice in choices:  # prefix/substring — e.g. "fable-5" -> "claude-fable-5[1m]"
+            value = str(choice.get("value") or "").lower()
+            name = str(choice.get("name") or "").lower()
+            # Both directions: versioned Hermes ids ("opus-5", "haiku-4.5")
+            # must reach the adapter's short values ("opus", "haiku"), and
+            # short requests ("fable") must reach long values
+            # ("claude-fable-5[1m]"). Names count too ("fable-5" vs "Fable").
+            #
+            # Values may carry a context-window suffix ("opus[1m]"), so the
+            # stem test has to be a plain prefix match: "opus-5" -> stem
+            # "opus" -> "opus[1m]". Requiring equality or a "-" separator
+            # matched only suffix-less values, so "haiku-4.5" and "sonnet-5"
+            # resolved while "opus-5" raised.
+            #
+            # Strip a vendor prefix before stemming, or every "claude-*" id
+            # stems to "claude" and silently binds to whichever "claude-"
+            # value comes first in the list — "claude-opus-5" resolved to
+            # claude-fable-5[1m], a different and pricier model, with no error.
+            req_stem = req[len("claude-"):] if req.startswith("claude-") else req
+            req_stem = req_stem.split("-", 1)[0]
+            if (
+                value.startswith(req) or req in value
+                or req.startswith(value) or (name and req.startswith(name))
+                or (req_stem and (value.startswith(req_stem) or req_stem == name))
+            ):
+                return (config_id, str(choice.get("value") or ""), current)
+
+        available = ", ".join(str(c.get("value")) for c in choices) or "(none)"
+        raise RuntimeError(
+            f"Model '{requested}' is not offered by this ACP agent. "
+            f"Available: {available}"
+        )
+
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+    ) -> tuple[str, str, str | None]:
         display = self.agent_display_name
         # Fast-fail a CLI that doesn't speak the transport we're about to
         # hand it. Without this, such a CLI exits immediately and the loop
@@ -825,6 +948,36 @@ class ACPClient:
             if not session_id:
                 raise RuntimeError(f"{display} ACP did not return a sessionId.")
 
+            # Honour the picker's model choice through the stable ACP config
+            # mechanism when the agent advertises one. Agents without a model
+            # option (e.g. Copilot today) keep the legacy prompt-hint path.
+            resolved_model: str | None = None
+            mapping = self._resolve_model_option(
+                session.get("configOptions") or [], model or "", self.agent_name
+            )
+            if mapping is not None:
+                config_id, target_value, current_value = mapping
+                resolved_model = current_value or None
+                if target_value and target_value != current_value:
+                    set_result = _request(
+                        "session/set_config_option",
+                        {
+                            "sessionId": session_id,
+                            "configId": config_id,
+                            "value": target_value,
+                        },
+                    ) or {}
+                    # The response carries the updated option list; read the
+                    # confirmed value back rather than assuming the set stuck.
+                    confirmed = self._resolve_model_option(
+                        set_result.get("configOptions") or [], "", self.agent_name
+                    )
+                    resolved_model = (confirmed[2] if confirmed else None) or target_value
+
+            prompt_text = self._maybe_append_model_hint(
+                prompt_text, model, mapping, self.agent_name
+            )
+
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             _request(
@@ -841,7 +994,7 @@ class ACPClient:
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
             )
-            return "".join(text_parts), "".join(reasoning_parts)
+            return "".join(text_parts), "".join(reasoning_parts), resolved_model
         finally:
             self.close()
 

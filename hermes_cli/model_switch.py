@@ -2793,6 +2793,26 @@ def list_authenticated_providers(
         except Exception:
             pass  # best-effort; serial path still works as fallback
 
+    # Plugin-supplied ACP providers curate their own list via the profile's
+    # fallback_models (agent/acp_client.py maps those ids onto the agent's
+    # ACP "model" config option). _PROVIDER_MODELS predates the plugin
+    # registry, so merge live profile data here — otherwise the picker pins
+    # these providers to whatever static entry existed at snapshot time.
+    try:
+        from providers import list_providers as _plugin_list_providers
+        _plugin_profiles = _plugin_list_providers() or []
+        if isinstance(_plugin_profiles, dict):
+            _plugin_profiles = list(_plugin_profiles.values())
+        for _pprof in _plugin_profiles:
+            if getattr(_pprof, "auth_type", "") != "external_process":
+                continue
+            _fm = [str(m) for m in (getattr(_pprof, "fallback_models", ()) or ()) if m]
+            _pslug = str(getattr(_pprof, "name", "") or "").strip().lower()
+            if _fm and _pslug:
+                curated[_pslug] = _fm
+    except Exception as _plugin_curate_err:
+        logger.debug("Plugin curated-model merge skipped: %s", _plugin_curate_err)
+
     # --- 1. Check Hermes-mapped providers ---
     from hermes_cli.models import _AGGREGATOR_PROVIDERS as _AGG_PROVIDERS
     from hermes_cli.providers import ALIASES as _PROVIDER_ALIAS_TABLE

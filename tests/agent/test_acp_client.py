@@ -414,3 +414,66 @@ def test_probe_skipped_for_agents_that_never_pass_acp_flag(agent, args):
     with patch("agent.acp_client.subprocess.run") as run_mock:
         assert _acp_supported(f"{agent}-acp-bin", args) is True
     run_mock.assert_not_called()
+
+
+def test_prompt_formatter_never_carries_the_model_hint():
+    """The hint moved into _run_prompt behind the config-option gate: once
+    session/set_config_option honours a pick, a prompt-text hint naming the
+    requested id would contradict the model actually serving the session.
+    The formatter therefore must not emit it — for any input."""
+    from agent.acp_client import _format_messages_as_prompt
+
+    text = _format_messages_as_prompt([{"role": "user", "content": "hi"}])
+    assert "model hint" not in text.lower()
+
+
+def test_is_model_sentinel_table():
+    assert ACPClient._is_model_sentinel("", "claude")
+    assert ACPClient._is_model_sentinel("default", "claude")
+    assert ACPClient._is_model_sentinel("claude-acp", "claude")
+    assert ACPClient._is_model_sentinel("claude", "claude")
+    assert ACPClient._is_model_sentinel("  Default  ", "claude")
+    assert not ACPClient._is_model_sentinel("opus-5", "claude")
+    assert not ACPClient._is_model_sentinel("codex-acp", "claude")
+
+
+def test_resolve_model_option_explicit_sentinel_none_and_error():
+    opts = [{
+        "id": "model", "category": "model", "currentValue": "sonnet",
+        "options": [
+            {"value": "sonnet", "name": "Claude Sonnet 5"},
+            {"value": "opus[1m]", "name": "Claude Opus 5"},
+        ],
+    }]
+    # Explicit pick maps onto the advertised value (versioned id -> stem).
+    assert ACPClient._resolve_model_option(opts, "opus-5", "claude") == (
+        "model", "opus[1m]", "sonnet",
+    )
+    # Sentinel keeps the current value without a set call.
+    assert ACPClient._resolve_model_option(opts, "claude-acp", "claude") == (
+        "model", "sonnet", "sonnet",
+    )
+    # No advertised model option -> None (legacy prompt-hint path).
+    assert ACPClient._resolve_model_option([], "opus-5", "claude") is None
+    # Wrong explicit pick surfaces instead of silently serving the default.
+    with pytest.raises(RuntimeError):
+        ACPClient._resolve_model_option(opts, "no-such-model", "claude")
+
+
+def test_model_hint_gate():
+    """The hint appears ONLY when the config-option path did not run."""
+    f = ACPClient._maybe_append_model_hint
+    mapping_explicit = ("model", "opus[1m]", "sonnet")
+
+    # Explicit pick honoured via set_config_option -> NO hint.
+    assert f("P", "opus-5", mapping_explicit, "claude") == "P"
+    # No advertised model option -> legacy hint path kept (Copilot today).
+    assert f("P", "copilot-acp", None, "copilot") == (
+        "P\nHermes requested model hint: copilot-acp"
+    )
+    # Sentinel pick keeps the default -> hint kept (pre-existing behaviour).
+    assert f("P", "claude-acp", ("model", "sonnet", "sonnet"), "claude") == (
+        "P\nHermes requested model hint: claude-acp"
+    )
+    # No model requested -> nothing to hint.
+    assert f("P", None, None, "claude") == "P"
