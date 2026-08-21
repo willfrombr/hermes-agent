@@ -1889,6 +1889,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     """Return True only if the user has explicitly configured this provider.
 
     Checks:
+      0. auth_type is external_process (ACP agent backends)
       1. active_provider in auth.json matches
       2. model.provider in config.yaml matches
       3. Provider-specific env vars are set (e.g. ANTHROPIC_API_KEY)
@@ -1899,6 +1900,35 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     pattern applied to the setup wizard gate.
     """
     normalized = (provider_id or "").strip().lower()
+
+    # 0. External-process providers (ACP agent backends) are explicit by
+    # construction. Such a provider only exists because the user installed
+    # its plugin under plugins/model-providers/ and the agent's own ACP
+    # adapter binary — both deliberate acts. There is no ambient credential
+    # to gate: the spawned subprocess owns its own login, so Hermes never
+    # borrows a token on the user's behalf, which is the risk this function
+    # exists to prevent.
+    #
+    # Without this branch none of the checks below can ever pass for them —
+    # check 3 requires auth_type == "api_key", and check 4 requires a stored
+    # credential these providers deliberately do not have. The provider would
+    # therefore stay permanently invisible to explicit-only pickers unless it
+    # were made the user's *default* model, which defeats the purpose of
+    # offering it as one selectable backend among several.
+    # PROVIDER_REGISTRY is the manually-maintained table; plugin-supplied
+    # providers may only be reachable through the plugin registry depending on
+    # when derivation ran in this process. Fall back the same way check 3 does,
+    # or an ACP backend stays invisible in exactly the long-lived processes
+    # (desktop `hermes serve`) that matter most.
+    _ext_cfg = PROVIDER_REGISTRY.get(normalized)
+    if _ext_cfg is None:
+        try:
+            from hermes_cli.providers import get_provider
+            _ext_cfg = get_provider(normalized)
+        except Exception:
+            _ext_cfg = None
+    if _ext_cfg is not None and getattr(_ext_cfg, "auth_type", "") == "external_process":
+        return True
 
     # 1. Check auth.json active_provider
     try:
