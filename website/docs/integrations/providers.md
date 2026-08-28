@@ -285,6 +285,18 @@ vars, no code or plugin needed:
 | `HERMES_ACP_{NAME}_ARGS` | Override just the arguments for a registered agent |
 | `CLAUDE_ACP_BASE_URL` / `CODEX_ACP_BASE_URL` / … | Override the `acp://{agent}` backend marker per provider (declared by each plugin) |
 
+#### MCP servers
+
+ACP backends receive the MCP servers from your `mcp_servers` config at session
+start, the same set native Hermes tool use gets, with `${ENV_VAR}` placeholders
+resolved and exfiltration-shaped entries filtered out. Servers configured with
+neither a `command` nor a `url` are skipped.
+
+Permission requests for MCP tools (`mcp__<server>__<tool>`) are answered by
+whether `<server>` is one Hermes forwarded — a server the agent reaches on its
+own is refused regardless of `approvals.acp_mode`, and if no servers were
+forwarded, every MCP call is denied.
+
 #### Permission requests (`approvals.acp_mode`)
 
 ACP agents ask their client for permission before running commands they consider
@@ -302,9 +314,11 @@ approvals:
   acp_mode: bridge
 ```
 
-`HERMES_ACP_PERMISSION_MODE` overrides the config value for one process.
-Unrecognised values fall back to `bridge`, and any failure in the approval layer
-denies — an ACP backend never gets more privilege than Hermes's own terminal tool.
+This is config-only: there is deliberately no environment override, because the
+setting decides whether an ACP backend may take side effects and belongs
+somewhere an operator can audit. Unrecognised values fall back to `bridge`, and
+any failure in the approval layer denies — an ACP backend never gets more
+privilege than Hermes's own terminal tool.
 
 :::note Trade-offs vs. API providers
 ACP backends run one subprocess per request: no streaming, and Hermes tool use is

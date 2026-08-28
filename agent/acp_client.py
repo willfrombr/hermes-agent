@@ -182,6 +182,23 @@ def _select_option(options: Any, *, allow: bool) -> str | None:
     return None
 
 
+def _normalize_command(value: Any) -> str:
+    """Render a ``rawInput.command`` as a shell string.
+
+    ACP validates ``command`` as either a string or an argv list, and real
+    adapters emit both. ``str()`` on a list produces a Python repr
+    (``['rm', '-rf', 'x']``), which is not a command line: the approval layer
+    would then pattern-match against brackets and quotes instead of the actual
+    executable and flags, so a dangerous-command rule keyed on ``rm -rf``
+    would never fire. ``shlex.join`` hands the approval layer the same string
+    a shell would have received.
+    """
+    if isinstance(value, (list, tuple)):
+        parts = [str(part) for part in value if part is not None]
+        return shlex.join(parts).strip() if parts else ""
+    return str(value or "").strip()
+
+
 def _extract_permission_command(tool_call: Any) -> tuple[str, str]:
     """Best-effort ``(command, description)`` from a permission tool call.
 
@@ -197,7 +214,7 @@ def _extract_permission_command(tool_call: Any) -> tuple[str, str]:
     command = ""
     description = ""
     if isinstance(raw, dict):
-        command = str(raw.get("command") or "").strip()
+        command = _normalize_command(raw.get("command"))
         description = str(raw.get("description") or "").strip()
     title = str(tool_call.get("title") or "").strip()
     if not command:
@@ -207,14 +224,157 @@ def _extract_permission_command(tool_call: Any) -> tuple[str, str]:
     return command, description
 
 
+def _acp_mcp_servers() -> list[dict[str, Any]]:
+    """Hermes's configured MCP servers, in the shape ``session/new`` wants.
+
+    Previously this was hardcoded to ``[]``, so an ACP backend ran with none
+    of the user's MCP servers even though every other Hermes backend had
+    them. Reuse ``tools.mcp_tool._load_mcp_config`` rather than re-reading
+    ``config.yaml`` here: it already drops exfiltration-shaped entries
+    (``_filter_suspicious_mcp_servers``) and resolves ``${ENV_VAR}``
+    placeholders, and duplicating that logic is how the two paths would
+    eventually disagree about which servers are safe to spawn.
+
+    ACP takes ``env`` and ``headers`` as name/value pair lists rather than
+    objects. Entries we cannot express in an ACP transport are skipped rather
+    than sent malformed.
+    """
+    try:
+        from tools.mcp_tool import _load_mcp_config
+    except Exception:  # pragma: no cover - MCP layer unavailable
+        logger.debug("MCP config unavailable for ACP forwarding", exc_info=True)
+        return []
+
+    try:
+        configured = _load_mcp_config() or {}
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Failed to load MCP config for ACP forwarding", exc_info=True)
+        return []
+
+    def _pairs(mapping: Any) -> list[dict[str, str]]:
+        if not isinstance(mapping, dict):
+            return []
+        return [
+            {"name": str(key), "value": str(value)}
+            for key, value in mapping.items()
+            if value is not None
+        ]
+
+    servers: list[dict[str, Any]] = []
+    for name, cfg in configured.items():
+        if not isinstance(cfg, dict):
+            continue
+        url = str(cfg.get("url") or "").strip()
+        command = str(cfg.get("command") or "").strip()
+        if url:
+            servers.append({
+                "type": "http",
+                "name": str(name),
+                "url": url,
+                "headers": _pairs(cfg.get("headers")),
+            })
+        elif command:
+            servers.append({
+                "name": str(name),
+                "command": command,
+                "args": [str(a) for a in (cfg.get("args") or [])],
+                "env": _pairs(cfg.get("env")),
+            })
+        else:
+            logger.debug(
+                "Skipping MCP server '%s' for ACP: no url or command", name
+            )
+    return servers
+
+
+_MCP_TOOL_PREFIX = "mcp__"
+
+
+def _mcp_server_from_tool_name(name: str) -> str | None:
+    """Return the server name from an ``mcp__<server>__<tool>`` identifier.
+
+    ``None`` when the name is not an MCP tool call, so callers can tell
+    "not MCP" apart from "MCP, server unknown".
+    """
+    if not name.startswith(_MCP_TOOL_PREFIX):
+        return None
+    rest = name[len(_MCP_TOOL_PREFIX):]
+    server, sep, _tool = rest.partition("__")
+    if not sep or not server:
+        return None
+    return server
+
+
+def _extract_mcp_tool_name(tool_call: Any) -> str | None:
+    """Find an ``mcp__*`` identifier anywhere an adapter might put it."""
+    if not isinstance(tool_call, dict):
+        return None
+    raw = tool_call.get("rawInput") or tool_call.get("raw_input") or {}
+    candidates = [
+        tool_call.get("toolName"),
+        tool_call.get("name"),
+        tool_call.get("title"),
+    ]
+    if isinstance(raw, dict):
+        candidates.extend([raw.get("name"), raw.get("tool"), raw.get("toolName")])
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text.startswith(_MCP_TOOL_PREFIX):
+            return text
+    return None
+
+
+_ERROR_DATA_LIMIT = 600
+
+
+def _error_detail(err: Any) -> str:
+    """Render a JSON-RPC ``error.data`` payload as a bounded suffix.
+
+    ``error.message`` is usually a one-liner like "Tool execution failed";
+    the actionable part (which tool, which path, which upstream status) lives
+    in ``error.data``. Dropping it left users with an error that named no
+    cause. Bounded because ``data`` is adapter-controlled and unbounded — a
+    stack trace or a whole response body must not become the exception text.
+    """
+    if not isinstance(err, dict):
+        return ""
+    data = err.get("data")
+    if data is None:
+        return ""
+    if isinstance(data, dict):
+        detail = data.get("message") or data.get("details") or data
+    else:
+        detail = data
+    if isinstance(detail, (dict, list)):
+        try:
+            text = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            text = str(detail)
+    else:
+        text = str(detail)
+    text = " ".join(text.split()).strip()
+    if not text:
+        return ""
+    if len(text) > _ERROR_DATA_LIMIT:
+        text = text[:_ERROR_DATA_LIMIT] + "… (truncated)"
+    return f" ({text})"
+
+
 _ACP_PERMISSION_MODES = ("bridge", "deny", "allow")
 
 
 def _acp_permission_mode() -> str:
-    """Resolve ``approvals.acp_mode`` (env override wins). Defaults to bridge."""
-    override = os.getenv("HERMES_ACP_PERMISSION_MODE", "").strip().lower()
-    if override in _ACP_PERMISSION_MODES:
-        return override
+    """Resolve ``approvals.acp_mode``. Defaults to bridge.
+
+    Config-only by design. An earlier revision honoured a
+    ``HERMES_ACP_PERMISSION_MODE`` environment override, which was the wrong
+    channel: this is a user-facing behaviour switch that decides whether an
+    ACP backend may take side effects, not a secret. Environment variables
+    are invisible in ``config.yaml``, inherited silently by subprocesses, and
+    not something an operator can audit after the fact — so the override
+    could quietly widen an ACP agent's authority with no trace in the file
+    that is supposed to describe the deployment's approval posture.
+    """
     try:
         from tools.approval import _get_approval_config
 
@@ -582,6 +742,9 @@ class ACPClient:
             self._acp_command, resolved_args = resolve_agent_launch(self.agent_name)
         self._acp_args = list(acp_args or args or resolved_args)
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        # Populated in _run_prompt once session/new has been sent. Empty
+        # means "no MCP server was forwarded", which denies every mcp__* call.
+        self._forwarded_mcp_servers: set[str] = set()
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -945,7 +1108,8 @@ class ACPClient:
                 if "error" in msg:
                     err = msg.get("error") or {}
                     raise RuntimeError(
-                        f"{display} ACP {method} failed: {err.get('message') or err}"
+                        f"{display} ACP {method} failed: "
+                        f"{err.get('message') or err}{_error_detail(err)}"
                     )
                 return msg.get("result")
 
@@ -975,11 +1139,19 @@ class ACPClient:
                     },
                 },
             )
+            mcp_servers = _acp_mcp_servers()
+            # Remember exactly what we handed over. _decide_permission scopes
+            # mcp__* approvals to this set, so it must be what was actually
+            # sent, not what the config happens to say at approval time.
+            self._forwarded_mcp_servers = {
+                str(server.get("name") or "") for server in mcp_servers
+            }
+            self._forwarded_mcp_servers.discard("")
             session = _request(
                 "session/new",
                 {
                     "cwd": self._acp_cwd,
-                    "mcpServers": [],
+                    "mcpServers": mcp_servers,
                 },
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
@@ -1039,10 +1211,13 @@ class ACPClient:
     def _decide_permission(self, message_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         """Answer an agent's ``session/request_permission``.
 
-        Modes (``approvals.acp_mode``, or ``HERMES_ACP_PERMISSION_MODE``):
+        Modes (``approvals.acp_mode``):
 
         ``bridge`` (default)
-            Route the request through :func:`tools.approval.check_dangerous_command`
+            MCP tool calls (``mcp__<server>__<tool>``) are decided by whether
+            ``<server>`` is one Hermes forwarded at ``session/new``; they
+            never reach the shell-command gate. Everything else routes
+            through :func:`tools.approval.check_dangerous_command`
             — the same gate ``terminal_tool`` uses before running anything. Safe
             commands pass straight through; dangerous ones honour the user's
             deny rules, allowlists, ``/yolo``, and (in a gateway session) an
@@ -1072,7 +1247,35 @@ class ACPClient:
                     else _permission_denied(message_id)
                 )
 
-            command, description = _extract_permission_command(params.get("toolCall"))
+            tool_call = params.get("toolCall")
+
+            # MCP tool calls are not shell commands. Routing them through
+            # check_dangerous_command matched an "mcp__github__create_issue"
+            # title against shell-command rules, which is meaningless: it
+            # neither protects anything (there is no shell to guard) nor
+            # approves reliably (the title is not a command line). Decide
+            # them on the only question that matters — did we hand this
+            # server to the agent ourselves?
+            mcp_tool = _extract_mcp_tool_name(tool_call)
+            if mcp_tool is not None:
+                server = _mcp_server_from_tool_name(mcp_tool)
+                approved = bool(server) and server in self._forwarded_mcp_servers
+                logger.info(
+                    "%s ACP MCP permission %s: %s (server=%s, forwarded=%s)",
+                    self.agent_display_name,
+                    "approved" if approved else "denied",
+                    mcp_tool,
+                    server or "?",
+                    sorted(self._forwarded_mcp_servers) or "(none)",
+                )
+                option_id = _select_option(options, allow=approved)
+                return (
+                    _permission_selected(message_id, option_id)
+                    if option_id
+                    else _permission_denied(message_id)
+                )
+
+            command, description = _extract_permission_command(tool_call)
             if not command:
                 logger.warning(
                     "%s ACP permission request carried no identifiable command; denying",

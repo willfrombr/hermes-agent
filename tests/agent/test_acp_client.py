@@ -300,7 +300,6 @@ def test_permission_failure_is_fail_safe():
 def test_acp_permission_mode_defaults_to_bridge(monkeypatch):
     from agent.acp_client import _acp_permission_mode
 
-    monkeypatch.delenv("HERMES_ACP_PERMISSION_MODE", raising=False)
     with patch("tools.approval._get_approval_config", return_value={}):
         assert _acp_permission_mode() == "bridge"
     with patch("tools.approval._get_approval_config", return_value={"acp_mode": "DENY"}):
@@ -310,12 +309,20 @@ def test_acp_permission_mode_defaults_to_bridge(monkeypatch):
         assert _acp_permission_mode() == "bridge"
 
 
-def test_acp_permission_mode_env_override_wins(monkeypatch):
+def test_acp_permission_mode_ignores_env_override(monkeypatch):
+    """The permission mode is config-only; no environment variable may widen it.
+
+    An earlier revision let HERMES_ACP_PERMISSION_MODE win over config.yaml.
+    That is the wrong channel for a switch deciding whether an ACP backend may
+    take side effects: it is invisible in config, silently inherited by
+    subprocesses, and leaves no audit trail. Pin the removal so it cannot be
+    reintroduced as a convenience.
+    """
     from agent.acp_client import _acp_permission_mode
 
     monkeypatch.setenv("HERMES_ACP_PERMISSION_MODE", "allow")
     with patch("tools.approval._get_approval_config", return_value={"acp_mode": "deny"}):
-        assert _acp_permission_mode() == "allow"
+        assert _acp_permission_mode() == "deny"
 
 
 # ── --acp support probe (ported from the Copilot client: #87308 / #87309) ──
@@ -414,6 +421,181 @@ def test_probe_skipped_for_agents_that_never_pass_acp_flag(agent, args):
     with patch("agent.acp_client.subprocess.run") as run_mock:
         assert _acp_supported(f"{agent}-acp-bin", args) is True
     run_mock.assert_not_called()
+
+
+# ── sweeper review 4814814081: MCP forwarding, command shapes, diagnostics ──
+
+
+def test_normalize_command_joins_argv_lists():
+    """A list-shaped rawInput.command must reach approval as a command line.
+
+    str() on a list yields a Python repr, so the approval layer would match
+    its rules against brackets and quotes instead of the executable and its
+    flags — a deny rule keyed on "rm -rf" would never fire.
+    """
+    from agent.acp_client import _extract_permission_command, _normalize_command
+
+    assert _normalize_command(["rm", "-rf", "/tmp/x"]) == "rm -rf /tmp/x"
+    assert _normalize_command(["echo", "a b"]) == "echo 'a b'"
+    assert _normalize_command("rm -rf /tmp/x") == "rm -rf /tmp/x"
+    assert _normalize_command(None) == ""
+    assert _normalize_command([]) == ""
+
+    command, _ = _extract_permission_command(
+        {"rawInput": {"command": ["rm", "-rf", "/tmp/x"]}, "title": "Remove"}
+    )
+    assert command == "rm -rf /tmp/x"
+    assert "[" not in command
+
+
+def test_error_detail_is_surfaced_and_bounded():
+    from agent.acp_client import _ERROR_DATA_LIMIT, _error_detail
+
+    assert _error_detail({"message": "boom"}) == ""
+    assert _error_detail({"data": {"message": "tool X failed: ENOENT"}}) == (
+        " (tool X failed: ENOENT)"
+    )
+    assert _error_detail({"data": "plain detail"}) == " (plain detail)"
+    # Structured payloads without a message key still surface something usable.
+    assert "status" in _error_detail({"data": {"status": 503}})
+    # Adapter-controlled payloads are unbounded; the exception text is not.
+    long = _error_detail({"data": "x" * 5000})
+    assert len(long) < _ERROR_DATA_LIMIT + 40
+    assert long.endswith("… (truncated))")
+
+
+def test_acp_mcp_servers_converts_config_to_acp_shape():
+    """Forwarded servers come from the same loader native MCP uses.
+
+    _load_mcp_config already filters exfiltration-shaped entries and resolves
+    ${ENV_VAR}; re-reading config.yaml here is how the two paths would drift
+    on which servers are safe to spawn.
+    """
+    from agent.acp_client import _acp_mcp_servers
+
+    config = {
+        "stdioserver": {
+            "command": "uvx",
+            "args": ["some-server"],
+            "env": {"TOKEN": "resolved-secret"},
+        },
+        "httpserver": {
+            "url": "https://example.invalid/mcp",
+            "headers": {"Authorization": "Bearer t"},
+        },
+        "brokenserver": {"description": "neither url nor command"},
+    }
+    with patch("tools.mcp_tool._load_mcp_config", return_value=config):
+        servers = _acp_mcp_servers()
+
+    by_name = {s["name"]: s for s in servers}
+    assert set(by_name) == {"stdioserver", "httpserver"}, "malformed entry dropped"
+    assert by_name["stdioserver"]["command"] == "uvx"
+    assert by_name["stdioserver"]["args"] == ["some-server"]
+    # ACP takes env/headers as name/value pair lists, not objects.
+    assert by_name["stdioserver"]["env"] == [
+        {"name": "TOKEN", "value": "resolved-secret"}
+    ]
+    assert by_name["httpserver"]["type"] == "http"
+    assert by_name["httpserver"]["headers"] == [
+        {"name": "Authorization", "value": "Bearer t"}
+    ]
+
+
+def test_acp_mcp_servers_returns_empty_when_config_layer_fails():
+    """A broken MCP config must not take the whole ACP turn down."""
+    from agent.acp_client import _acp_mcp_servers
+
+    with patch("tools.mcp_tool._load_mcp_config", side_effect=RuntimeError("boom")):
+        assert _acp_mcp_servers() == []
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("mcp__github__create_issue", "github"),
+    ("mcp__my_server__tool__with__underscores", "my_server"),
+    ("mcp__nounderscoresuffix", None),
+    ("mcp____empty", None),
+    ("terminal_tool", None),
+    ("", None),
+])
+def test_mcp_server_from_tool_name(name, expected):
+    from agent.acp_client import _mcp_server_from_tool_name
+
+    assert _mcp_server_from_tool_name(name) == expected
+
+
+def test_mcp_permissions_scoped_to_forwarded_servers():
+    """mcp__* is decided by provenance, not by shell-command rules.
+
+    Approving an MCP call because its title happened not to look like a
+    dangerous shell command is meaningless. The question that matters is
+    whether Hermes handed the agent that server in the first place, so a
+    server the agent found on its own is refused even in bridge mode.
+    """
+    from agent.acp_client import _select_option
+
+    client = _client()
+    client._forwarded_mcp_servers = {"github"}
+
+    params = {
+        "toolCall": {"toolName": "mcp__github__create_issue"},
+        "options": _permission_params()["options"],
+    }
+    with patch("tools.approval.check_dangerous_command") as gate:
+        response = client._decide_permission(1, params)
+    assert _outcome(response) == {
+        "outcome": "selected",
+        "optionId": _select_option(params["options"], allow=True),
+    }
+    gate.assert_not_called(), "MCP calls must not reach the shell-command gate"
+
+    # A server Hermes never forwarded is refused, however benign it looks.
+    params["toolCall"] = {"toolName": "mcp__attacker__exfiltrate"}
+    with patch("tools.approval.check_dangerous_command") as gate:
+        response = client._decide_permission(1, params)
+    assert _outcome(response) == {
+        "outcome": "selected",
+        "optionId": _select_option(params["options"], allow=False),
+    }
+    gate.assert_not_called()
+
+
+def test_mcp_permission_denied_when_nothing_was_forwarded():
+    """Empty forwarded set denies every mcp__* call — fail closed."""
+    client = _client()
+    assert client._forwarded_mcp_servers == set()
+
+    params = {
+        "toolCall": {"toolName": "mcp__github__create_issue"},
+        "options": _permission_params()["options"],
+    }
+    from agent.acp_client import _select_option
+
+    with patch("tools.approval.check_dangerous_command") as gate:
+        response = client._decide_permission(1, params)
+    assert _outcome(response) == {
+        "outcome": "selected",
+        "optionId": _select_option(params["options"], allow=False),
+    }
+    gate.assert_not_called()
+
+
+def test_non_mcp_permissions_still_reach_the_shell_gate():
+    """The MCP branch must not swallow ordinary command approvals."""
+    client = _client()
+    client._forwarded_mcp_servers = {"github"}
+
+    params = {
+        "toolCall": {"rawInput": {"command": ["ls", "-la"]}, "title": "List"},
+        "options": _permission_params()["options"],
+    }
+    with patch(
+        "tools.approval.check_dangerous_command", return_value={"approved": True}
+    ) as gate:
+        client._decide_permission(1, params)
+    gate.assert_called_once()
+    # And it receives a shell string, not a Python list repr.
+    assert gate.call_args[0][0] == "ls -la"
 
 
 def test_prompt_formatter_never_carries_the_model_hint():
