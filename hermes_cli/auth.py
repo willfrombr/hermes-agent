@@ -1902,12 +1902,15 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     normalized = (provider_id or "").strip().lower()
 
     # 0. External-process providers (ACP agent backends) are explicit by
-    # construction. Such a provider only exists because the user installed
-    # its plugin under plugins/model-providers/ and the agent's own ACP
-    # adapter binary — both deliberate acts. There is no ambient credential
-    # to gate: the spawned subprocess owns its own login, so Hermes never
-    # borrows a token on the user's behalf, which is the risk this function
-    # exists to prevent.
+    # construction — but NOT because every one arrives via a plugin
+    # (copilot-acp is core-bundled). The actual invariant is twofold:
+    # there is no ambient credential to gate — the spawned subprocess owns
+    # its own login, so Hermes never borrows a token on the user's behalf,
+    # which is the risk this function exists to prevent — and the provider
+    # is only *offered* at all once its adapter binary resolves on PATH,
+    # a check the registry already performs upstream of this gate. A
+    # provider that is credential-less by design and whose binary the user
+    # put on PATH is as explicit as configuration gets.
     #
     # Without this branch none of the checks below can ever pass for them —
     # check 3 requires auth_type == "api_key", and check 4 requires a stored
