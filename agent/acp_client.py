@@ -759,32 +759,70 @@ class ACPClient:
             name = str(choice.get("name") or "")
             if req == value.lower() or req == name.lower():
                 return (config_id, value, current)
-        for choice in choices:  # prefix/substring — e.g. "fable-5" -> "claude-fable-5[1m]"
-            value = str(choice.get("value") or "").lower()
-            name = str(choice.get("name") or "").lower()
-            # Both directions: versioned Hermes ids ("opus-5", "haiku-4.5")
-            # must reach the adapter's short values ("opus", "haiku"), and
-            # short requests ("fable") must reach long values
-            # ("claude-fable-5[1m]"). Names count too ("fable-5" vs "Fable").
-            #
-            # Values may carry a context-window suffix ("opus[1m]"), so the
-            # stem test has to be a plain prefix match: "opus-5" -> stem
-            # "opus" -> "opus[1m]". Requiring equality or a "-" separator
-            # matched only suffix-less values, so "haiku-4.5" and "sonnet-5"
-            # resolved while "opus-5" raised.
-            #
-            # Strip a vendor prefix before stemming, or every "claude-*" id
-            # stems to "claude" and silently binds to whichever "claude-"
-            # value comes first in the list — "claude-opus-5" resolved to
-            # claude-fable-5[1m], a different and pricier model, with no error.
-            req_stem = req[len("claude-"):] if req.startswith("claude-") else req
-            req_stem = req_stem.split("-", 1)[0]
-            if (
-                value.startswith(req) or req in value
-                or req.startswith(value) or (name and req.startswith(name))
-                or (req_stem and (value.startswith(req_stem) or req_stem == name))
-            ):
-                return (config_id, str(choice.get("value") or ""), current)
+        # Fuzzy fallback, SCORED — first-match-wins silently served a
+        # different model than requested ("gpt-5-mini" against ["gpt-5", ...]
+        # bound to "gpt-5" with no error). That is the exact failure class
+        # this patch exists to eliminate, so the fallback only accepts a
+        # candidate whose difference from the request is a VERSION tail,
+        # and only when the winner is unique:
+        #
+        #   norm(x): lowercase, drop a bracket suffix ("opus[1m]" -> "opus"),
+        #            drop a leading "<agent_name>-" (agent-neutral — NOT a
+        #            hardcoded vendor prefix).
+        #   score 2: norm(request) == norm(value) or == norm(name)
+        #            ("fable-5" == "claude-fable-5[1m]" for agent claude).
+        #   score 1: one of the pair extends the other by "-<version>",
+        #            where <version> starts with a digit ("opus-5" matches
+        #            "opus[1m]" via tail "5"; "haiku-4.5" matches "haiku").
+        #            "-mini"/"-turbo" tails are NOT versions and never match.
+        #
+        # Multiple distinct values at the top score raise: a request that
+        # could mean two models must surface, not quietly pick one.
+        import re as _re
+
+        def _norm(text: str) -> str:
+            t = (text or "").lower()
+            t = _re.sub(r"\[[^\]]*\]$", "", t).strip()
+            prefix = f"{agent_name.lower()}-"
+            return t.removeprefix(prefix)
+
+        def _version_extension(a: str, b: str) -> bool:
+            """True when the longer of a/b is the shorter + '-<digit-led tail>'."""
+            if len(a) == len(b):
+                return False
+            short, long_ = (a, b) if len(a) < len(b) else (b, a)
+            if not long_.startswith(short + "-"):
+                return False
+            tail = long_[len(short) + 1 :]
+            return bool(_re.match(r"^[0-9][0-9a-z.\-]*$", tail))
+
+        req_n = _norm(req)
+
+        def _score(choice) -> int:
+            value_n = _norm(str(choice.get("value") or ""))
+            name_n = _norm(str(choice.get("name") or ""))
+            for cand in (value_n, name_n):
+                if cand and cand == req_n:
+                    return 2
+            for cand in (value_n, name_n):
+                if cand and _version_extension(req_n, cand):
+                    return 1
+            return 0
+
+        scored = [(_score(c), c) for c in choices]
+        top = max((sc for sc, _ in scored), default=0)
+        if top > 0:
+            contenders = {
+                str(c.get("value") or "") for sc, c in scored if sc == top
+            }
+            if len(contenders) > 1:
+                raise RuntimeError(
+                    f"Model '{requested}' is ambiguous for this ACP agent — "
+                    f"it matches: {', '.join(sorted(contenders))}. "
+                    f"Pick one of those ids exactly."
+                )
+            winner = next(c for sc, c in scored if sc == top)
+            return (config_id, str(winner.get("value") or ""), current)
 
         available = ", ".join(str(c.get("value")) for c in choices) or "(none)"
         raise RuntimeError(

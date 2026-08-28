@@ -477,3 +477,52 @@ def test_model_hint_gate():
     )
     # No model requested -> nothing to hint.
     assert f("P", None, None, "claude") == "P"
+
+
+def test_resolve_model_option_never_serves_a_variant_silently():
+    """Review counterexample: 'gpt-5-mini' against ['gpt-5', ...] must NOT
+    bind to 'gpt-5' — '-mini' is a different model, not a version tail. The
+    old first-match-wins fallback served it silently; the scored resolver
+    must raise instead."""
+    opts = [{
+        "id": "model", "category": "model", "currentValue": "gpt-5",
+        "options": [{"value": "gpt-5", "name": "GPT-5"}],
+    }]
+    with pytest.raises(RuntimeError):
+        ACPClient._resolve_model_option(opts, "gpt-5-mini", "codex")
+
+
+def test_resolve_model_option_version_tails_still_match():
+    opts = [{
+        "id": "model", "category": "model", "currentValue": "sonnet",
+        "options": [
+            {"value": "opus[1m]", "name": "Claude Opus 5"},
+            {"value": "haiku", "name": "Claude Haiku"},
+        ],
+    }]
+    # Version tails are legitimate in both directions.
+    assert ACPClient._resolve_model_option(opts, "opus-5", "claude")[1] == "opus[1m]"
+    assert ACPClient._resolve_model_option(opts, "haiku-4.5", "claude")[1] == "haiku"
+
+
+def test_resolve_model_option_ambiguity_raises_with_candidates():
+    opts = [{
+        "id": "model", "category": "model", "currentValue": "o1[1m]",
+        "options": [
+            {"value": "o1[1m]", "name": "O One Fast"},
+            {"value": "o1[200k]", "name": "O One Long"},
+        ],
+    }]
+    with pytest.raises(RuntimeError) as exc:
+        ACPClient._resolve_model_option(opts, "o1", "codex")
+    assert "ambiguous" in str(exc.value)
+    assert "o1[1m]" in str(exc.value) and "o1[200k]" in str(exc.value)
+
+
+def test_resolve_model_option_agent_prefix_is_neutral():
+    """No hardcoded 'claude-': the agent's own name is the stripped prefix."""
+    opts = [{
+        "id": "model", "category": "model", "currentValue": "gpt-5",
+        "options": [{"value": "gpt-5", "name": "GPT-5"}],
+    }]
+    assert ACPClient._resolve_model_option(opts, "codex-gpt-5", "codex")[1] == "gpt-5"
